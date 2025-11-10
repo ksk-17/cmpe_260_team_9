@@ -1,4 +1,3 @@
-# arc_dataset.py
 from __future__ import annotations
 import json, math, random
 from pathlib import Path
@@ -6,41 +5,65 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-ColorInt = int  # 0..9
-Grid = List[List[ColorInt]]  # rectangular, sizes up to 30x30
+ColorInt = int
+Grid = List[List[ColorInt]]
+
+NUM_CLASSES = 10
+K_MAX = 3
+CANVAS_H, CANVAS_W = 30, 30
 
 def grid_to_tensor(grid: Grid) -> torch.LongTensor:
     return torch.as_tensor(grid, dtype=torch.long)
 
 def pad_to(t: torch.Tensor, target_h: int, target_w: int, pad_value: int = -1) -> torch.Tensor:
+    """Pad/crop 2D Long tensor (H,W) to (target_h, target_w). Uses -1 as 'empty' by default."""
     h, w = t.shape[-2], t.shape[-1]
+    if h > target_h or w > target_w:
+        t = t[:target_h, :target_w]
+        h, w = t.shape
     pad_bottom = target_h - h
-    pad_right = target_w - w
-    if pad_bottom < 0 or pad_right < 0:
-        raise ValueError(f"Target size smaller than tensor: tensor=({h},{w}), target=({target_h},{target_w})")
-    # torch.nn.functional.pad pads (left, right, top, bottom)
+    pad_right  = target_w - w
     return torch.nn.functional.pad(t, (0, pad_right, 0, pad_bottom), value=pad_value)
+
+def one_hot_encoding(t: torch.Tensor, num_classes: int = NUM_CLASSES) -> torch.Tensor:
+    """
+    t: (..., H, W) Long with values in [0..num_classes-1] or -1 for 'empty'.
+    Returns: (..., C, H, W) float32 with zeros where t == -1.
+    """
+    t = torch.as_tensor(t, dtype=torch.long)
+    mask = (t >= 0)
+    safe = torch.where(mask, t, torch.zeros_like(t))
+    oh = torch.nn.functional.one_hot(safe, num_classes=num_classes)  # (..., H, W, C)
+    oh = oh.movedim(-1, -3).contiguous().float()                     # (..., C, H, W)
+    if mask.ndim == 2:
+        oh *= mask.unsqueeze(0)
+    else:
+        oh *= mask.unsqueeze(-3)
+    return oh
 
 def rotate_grid_tensor(t: torch.Tensor, k: int) -> torch.Tensor:
     k = k % 4
-    if k == 0:
-        return t
-    if k == 1:
-        return torch.rot90(t, 1, dims=(-2, -1))
-    if k == 2:
-        return torch.rot90(t, 2, dims=(-2, -1))
-    if k == 3:
-        return torch.rot90(t, 3, dims=(-2, -1))
+    if k == 0: return t
+    return torch.rot90(t, k, dims=(-2, -1))
 
 def flip_grid_tensor(t: torch.Tensor, horizontal: bool = True) -> torch.Tensor:
     return torch.flip(t, dims=(-1,)) if horizontal else torch.flip(t, dims=(-2,))
 
 def permute_colors_tensor(t: torch.Tensor, perm: Dict[int, int]) -> torch.Tensor:
+    # Works on Long tensor (H,W) with -1 allowed
     out = t.clone()
     mask = out >= 0
-    out[mask] = out[mask].apply_(lambda v: perm.get(int(v), int(v)))
+    if mask.any():
+        flat = out[mask].view(-1)
+        # vectorized permutation
+        lut = torch.arange(NUM_CLASSES, dtype=torch.long)
+        for k, v in perm.items():
+            lut[k] = v
+        out[mask] = lut[flat]
     return out
 
 class ArcAugment:
@@ -61,9 +84,9 @@ class ArcAugment:
     def _maybe_perm(self) -> Optional[Dict[int, int]]:
         if not self.color_permute:
             return None
-        palette = list(range(10))
+        palette = list(range(NUM_CLASSES))
         self.rng.shuffle(palette)
-        return {i: palette[i] for i in range(10)}
+        return {i: palette[i] for i in range(NUM_CLASSES)}
 
     def _aug_grid(self, t: torch.Tensor, perm: Optional[Dict[int, int]]) -> torch.Tensor:
         # rotations
@@ -104,7 +127,6 @@ def load_solutions(path: Optional[Path]) -> Dict[str, Grid]:
     if path is None:
         return {}
     data = load_json(path)
-    # normalize to python dict[str, grid]
     return {str(k): v for k, v in data.items()}
 
 class ArcChallengesDataset(Dataset):
@@ -142,17 +164,16 @@ class ArcChallengesDataset(Dataset):
 
         sample: Dict[str, Any] = {
             "id": task_id,
-            "train_pairs": train_pairs,
-            "test_input": test_input,
+            "train_pairs": train_pairs,   # list of {"input": Long[h,w], "output": Long[h,w]}
+            "test_input": test_input,     # Long[h,w]
             "split": self.split_name,
         }
 
         # Attach ground-truth solution if available for this split
         if task_id in self.solutions:
-            sols = self.solutions[task_id]  # could be Grid or List[Grid]
-            # normalize to a single grid
-            if isinstance(sols, list):   # multiple valid solutions provided
-                sols = sols[0]           # choose first deterministically
+            sols = self.solutions[task_id]  # Grid or List[Grid]
+            if isinstance(sols, list):
+                sols = sols[0]
             sol = grid_to_tensor(sols)
             sample["solution"] = sol
 
@@ -161,10 +182,7 @@ class ArcChallengesDataset(Dataset):
 
         return sample
 
-def make_train_dataset(
-    root_dir: str | Path,
-    transform: Optional[Callable] = None
-) -> ArcChallengesDataset:
+def make_train_dataset(root_dir: str | Path, transform: Optional[Callable] = None) -> ArcChallengesDataset:
     root = Path(root_dir)
     return ArcChallengesDataset(
         challenges_json=root / "arc-agi_training_challenges.json",
@@ -173,10 +191,7 @@ def make_train_dataset(
         transform=transform,
     )
 
-def make_eval_dataset(
-    root_dir: str | Path,
-    transform: Optional[Callable] = None
-) -> ArcChallengesDataset:
+def make_eval_dataset(root_dir: str | Path, transform: Optional[Callable] = None) -> ArcChallengesDataset:
     root = Path(root_dir)
     return ArcChallengesDataset(
         challenges_json=root / "arc-agi_evaluation_challenges.json",
@@ -185,10 +200,7 @@ def make_eval_dataset(
         transform=transform,
     )
 
-def make_test_dataset(
-    root_dir: str | Path,
-    transform: Optional[Callable] = None
-) -> ArcChallengesDataset:
+def make_test_dataset(root_dir: str | Path, transform: Optional[Callable] = None) -> ArcChallengesDataset:
     root = Path(root_dir)
     return ArcChallengesDataset(
         challenges_json=root / "arc-agi_test_challenges.json",
@@ -197,70 +209,64 @@ def make_test_dataset(
         transform=transform,
     )
 
-def arc_collate(batch, pad_value: int = -1):
-    B = len(batch)
+# ---------- Packing helpers ----------
+def pack_one_item_vertical(item: Dict[str, Any],
+                           H: int = CANVAS_H,
+                           W: int = CANVAS_W,
+                           k_max: int = K_MAX) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Returns:
+      X: [10, (1+2*k_max)*H, W]  (channels=10, stacked vertically)
+      Y: [H, W] or None
+    """
+    # Build ordered list of grids: test_in, (xin,yout)*k
+    blocks: list[torch.Tensor] = []
+    test_in = pad_to(item["test_input"], H, W, pad_value=-1)
+    blocks.append(one_hot_encoding(test_in))  # [10,H,W]
+
+    pairs = item["train_pairs"][:k_max]
+    for p in pairs:
+        xin  = pad_to(p["input"],  H, W, pad_value=-1)
+        yout = pad_to(p["output"], H, W, pad_value=-1)
+        blocks.append(one_hot_encoding(xin))
+        blocks.append(one_hot_encoding(yout))
+
+    # If fewer than k_max, append zero blocks
+    while len(blocks) < (1 + 2*k_max):
+        blocks.append(torch.zeros(NUM_CLASSES, H, W))
+
+    # Concatenate along Height: result [10, (1+2k)*H, W]
+    X = torch.cat(blocks, dim=-2).contiguous().float()
+
+    Y = None
+    if "solution" in item:
+        target = pad_to(item["solution"], H, W, pad_value=-1)
+        Y = target  # [H,W] Long (may contain -1)
+    return X, Y
+
+def arc_collate(batch: list[Dict[str, Any]], pad_value: int = -1) -> Dict[str, Any]:
     ids = [b["id"] for b in batch]
     splits = [b["split"] for b in batch]
     has_solution = all("solution" in b for b in batch)
 
-    max_h, max_w, max_T = 1, 1, 1
-    for b in batch:
-        # demos
-        max_T = max(max_T, len(b["train_pairs"]))
-        for p in b["train_pairs"]:
-            h_i, w_i = p["input"].shape
-            h_o, w_o = p["output"].shape
-            max_h = max(max_h, h_i, h_o)
-            max_w = max(max_w, w_i, w_o)
+    Xs: list[torch.Tensor] = []
+    Ys: list[torch.Tensor] = []
+    for item in batch:
+        X, Y = pack_one_item_vertical(item, H=CANVAS_H, W=CANVAS_W, k_max=K_MAX)
+        Xs.append(X)
+        if has_solution and Y is not None:
+            Ys.append(Y)
 
-        # test
-        h_t, w_t = b["test_input"].shape
-        max_h = max(max_h, h_t); max_w = max(max_w, w_t)
-
-        # solution (robust to accidental leading batch dim)
-        if "solution" in b:
-            sol = b["solution"]
-            if sol.ndim == 3:
-                if sol.shape[0] != 1:
-                    raise ValueError(
-                        f"Each item must carry a single solution grid, but got shape {tuple(sol.shape)}"
-                    )
-                sol = sol.squeeze(0)
-                b["solution"] = sol  # normalize in-place
-            h_s, w_s = sol.shape[-2:]
-            max_h = max(max_h, h_s); max_w = max(max_w, w_s)
-
-    demo_in = torch.full((B, max_T, max_h, max_w), pad_value, dtype=torch.long)
-    demo_out = torch.full((B, max_T, max_h, max_w), pad_value, dtype=torch.long)
-    lengths = torch.zeros(B, dtype=torch.long)
-    test_batch = torch.full((B, max_h, max_w), pad_value, dtype=torch.long)
-    sol_batch = torch.full((B, max_h, max_w), pad_value, dtype=torch.long) if has_solution else None
-
-    for i, b in enumerate(batch):
-        T_i = len(b["train_pairs"])
-        lengths[i] = T_i
-        for t_idx, p in enumerate(b["train_pairs"]):
-            demo_in[i, t_idx]  = pad_to(p["input"],  max_h, max_w, pad_value)
-            demo_out[i, t_idx] = pad_to(p["output"], max_h, max_w, pad_value)
-
-        test_batch[i] = pad_to(b["test_input"], max_h, max_w, pad_value)
-
-        if has_solution:
-            sol = b["solution"]
-            if sol.ndim == 3:  # consistent with the check above, but double-sure
-                if sol.shape[0] != 1:
-                    raise ValueError(f"Expected (H,W) or (1,H,W) per item, got {tuple(sol.shape)}")
-                sol = sol.squeeze(0)
-            sol_batch[i] = pad_to(sol, max_h, max_w, pad_value)
-
-    out = {
+    X_batch = torch.stack(Xs, dim=0)     # [B, 10, (1+2K)*H, W]
+    out: Dict[str, Any] = {
         "id": ids,
         "split": splits,
-        "train_pairs": {"input": demo_in, "output": demo_out, "lengths": lengths},
-        "test_input": test_batch,
+        "test_input": X_batch,           # feed this to model(...)
+        "hw": (CANVAS_H, CANVAS_W),
+        "kmax": K_MAX,
     }
     if has_solution:
-        out["solution"] = sol_batch
+        out["target"] = torch.stack(Ys, dim=0)  # [B, H, W]
     return out
 
 def make_loader(
@@ -279,48 +285,23 @@ def make_loader(
         pin_memory=True,
     )
 
-def build_submission_json(
-    ids: Iterable[str],
-    preds: Iterable[torch.Tensor] | Iterable[np.ndarray] | Iterable[Grid],
-) -> Dict[str, Grid]:
-    sub: Dict[str, Grid] = {}
-    for task_id, g in zip(ids, preds):
-        if isinstance(g, torch.Tensor):
-            arr = g.detach().cpu().long().numpy()
-        elif isinstance(g, np.ndarray):
-            arr = g
-        else:
-            arr = np.asarray(g, dtype=int)
-        # ensure ints & nested list
-        sub[str(task_id)] = arr.astype(int).tolist()
-    return sub
-
-
 if __name__ == "__main__":
-    # 1) Datasets
-    root = "./arc-prize-2025"  # folder containing the jsons
+    root = "./arc-prize-2025"
     augment = ArcAugment(rotate=True, hflip=True, color_permute=True, seed=42)
 
-    train_ds = make_train_dataset(root, transform=augment)   # has ground-truth "solution"
-    eval_ds  = make_eval_dataset(root)                       # has ground-truth "solution"
-    test_ds  = make_test_dataset(root)                       # NO solutions
+    train_ds = make_train_dataset(root, transform=augment)
+    eval_ds  = make_eval_dataset(root)
+    test_ds  = make_test_dataset(root)
 
-    # 2) Loaders
     train_loader = make_loader(train_ds, batch_size=8, shuffle=True)
     eval_loader  = make_loader(eval_ds, batch_size=8, shuffle=False)
     test_loader  = make_loader(test_ds, batch_size=8, shuffle=False)
 
-    # 3) Inside your training loop (pseudo):
     for batch in train_loader:
-        pass
-
-    # 4) Build submission (after inference):
-    for batch in test_loader:
-        pass
-    #     # model predicts `y_hat` of shape (B,H,W) with integer colors in [0..9]
-    #     # ... your inference here ...
-        
-    #     ids.extend(batch["id"])
-    #     preds.extend(y_hat.detach().cpu())  # or np arrays
-
-    # submission = build_submission_json(ids, preds)
+        X = batch['test_input']      # [B, 10*(1+2*K_MAX), H, W]
+        print("X:", X.shape, X.dtype)
+        print("hw:", batch["hw"], "kmax:", batch["kmax"])
+        if "target" in batch:
+            Y = batch['target']      # [B, H, W]
+            print("Y:", Y.shape, Y.dtype, "has -1:", (Y == -1).any().item())
+        break
