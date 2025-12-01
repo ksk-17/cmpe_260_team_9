@@ -8,9 +8,6 @@ from torch.distributions import Categorical
 from collections import Counter
 
 # Imports assuming these files exist in your environment
-from arc_dataset import ARCTaskDataset
-from dsl import ARCDSL
-from executor_engine import ExecutionEngine
 from neural_solver import NeuroSolver, encode_context
 
 def compute_reward(pred, target, inp):
@@ -199,65 +196,111 @@ def run_dreamcoder(model, engine, task, dev):
 
     return loss, r
 
-def run_experiment():
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Comparison Experiment on {DEVICE}")
 
-    dataset = ARCTaskDataset("ARC-AGI/data/training")
-    dsl = ARCDSL()
-    engine = ExecutionEngine(dsl)
-
-    algos = {
-        'BSIL': run_bsil,
-        'PPO': run_ppo,
-        'DreamCoder': run_dreamcoder
-    }
-
-    results = {name: [] for name in algos}
-
-    for name, train_fn in algos.items():
-        print(f"\n--- Testing Algorithm: {name} ---")
-        # Use locally defined NeuroSolver to ensure correct architecture
-        model = NeuroSolver(dsl).to(DEVICE)
-        opt = optim.Adam(model.parameters(), lr=1e-3)
-
-        rewards_over_time = []
-
-        for epoch in range(5):
-            total_r = 0
-            subset_size = min(len(dataset), 50)
-
-            for i in range(subset_size):
-                opt.zero_grad()
-
-                # BSIL/DreamCoder return (loss, r, prog), PPO returns (loss, r)
-                ret = train_fn(model, engine, dataset[i], DEVICE)
-                if len(ret) == 3:
-                    loss, r, _ = ret
-                else:
-                    loss, r = ret
-
-                if isinstance(loss, torch.Tensor) and loss.requires_grad:
-                    loss.backward()
-                    opt.step()
-                total_r += r
-
-            avg = total_r / subset_size
-            rewards_over_time.append(avg)
-            print(f"Ep {epoch}: Avg Reward = {avg:.4f}")
-
-        results[name] = rewards_over_time
-
-    plt.figure(figsize=(10, 6))
-    for name, data in results.items():
-        plt.plot(data, label=name, marker='o')
-    plt.title("RL Algorithm Comparison on ARC Subset")
-    plt.xlabel("Epoch")
-    plt.ylabel("Avg Reward")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+class MCTSNode:
+    def __init__(self, parent=None, token=None):
+        self.parent = parent
+        self.token = token
+        self.children = {}
+        self.visits = 0
+        self.value = 0.0
+        self.prior = 0.0
 
 
-if __name__ == "__main__":
-    run_experiment()
+def run_mcts(model, engine, task, dev):
+    train_pairs = task['train']
+    if not train_pairs: return torch.tensor(0.0, requires_grad=True, device=dev), 0.0
+
+    ctx = encode_context(model, train_pairs[0]['input'], train_pairs[0]['output'], dev)
+    root = MCTSNode(token='<SOS>')
+
+    # 20 Simulations
+    for _ in range(20):
+        node = root
+        hx = ctx
+        depth = 0
+        seq = []
+
+        # 1. Selection
+        while node.children and depth < 10:
+            best_score = -float('inf')
+            best_child = None
+            for child in node.children.values():
+                u = child.value / (child.visits + 1e-6) + 1.0 * child.prior * np.sqrt(node.visits) / (1 + child.visits)
+                if u > best_score:
+                    best_score = u
+                    best_child = child
+            node = best_child
+            seq.append(node.token)
+
+            # Update RNN state
+            inp_tok = torch.tensor([model.token_to_id[node.token]], device=dev)
+            _, _, hx = model(inp_tok, hx, ctx)
+            depth += 1
+
+        # 2. Expansion
+        if depth < 10 and node.token != '<EOS>':
+            inp_tok = torch.tensor([model.token_to_id[node.token if node.token else '<SOS>']], device=dev)
+            logits, val, hx = model(inp_tok, hx, ctx)
+            probs = F.softmax(logits, dim=1).squeeze()
+
+            # Expand top 5 actions
+            topk = torch.topk(probs, 5)
+            for i in range(5):
+                idx = topk.indices[i].item()
+                tok_str = model.vocab[idx]
+                child = MCTSNode(parent=node, token=tok_str)
+                child.prior = topk.values[i].item()
+                node.children[tok_str] = child
+
+            # 3. Simulation (Value Estimate from Critic)
+            reward = val.item()
+        else:
+            # Terminal State - True Reward
+            clean = [p for p in seq if p not in ['<SOS>', '<EOS>']]
+            r_sum = 0
+            try:
+                for tp in train_pairs:
+                    res = engine.execute(clean, tp['input'])
+                    r_sum += compute_reward(res, tp['output'], tp['input'])
+                reward = r_sum / len(train_pairs)
+            except:
+                reward = 0
+
+        # 4. Backprop
+        while node:
+            node.visits += 1
+            node.value += reward
+            node = node.parent
+
+    # Select best path based on visits
+    seq = []
+    node = root
+    while node.children:
+        node = max(node.children.values(), key=lambda n: n.visits)
+        seq.append(node.token)
+        if node.token == '<EOS>': break
+
+    clean = [p for p in seq if p not in ['<SOS>', '<EOS>']]
+    final_r = 0
+    try:
+        for tp in train_pairs:
+            res = engine.execute(clean, tp['input'])
+            final_r += compute_reward(res, tp['output'], tp['input'])
+        final_r /= len(train_pairs)
+    except:
+        pass
+
+    # Train Supervised on MCTS path if it was good
+    loss = torch.tensor(0.0, requires_grad=True, device=dev)
+    if final_r > 0.1:
+        loss = 0
+        curr = torch.tensor([model.token_to_id['<SOS>']], device=dev)
+        hx = ctx
+        for t in seq:
+            l, _, hx = model(curr, hx, ctx)
+            tgt = torch.tensor([model.token_to_id[t]], device=dev)
+            loss += F.cross_entropy(l, tgt)
+            curr = tgt
+
+    return loss, final_r
